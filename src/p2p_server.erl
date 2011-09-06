@@ -5,7 +5,7 @@
 -define(SERVER, ?MODULE).
 -define(SEPARATOR, <<"\r\n\r\n">>).
 
--record(state, {table}).
+-record(state, {table, id, sock}).
 
 start_link(Port) ->
     GlobalState = #state{table = ets:new(p2p_table, [set, public])},
@@ -15,15 +15,11 @@ stop() ->
     socket_server:stop(?MODULE).
 
 init_loop(Socket, GlobalState) ->
-    Table = GlobalState#state.table,
-    {ok, PeerInfo} = inet:peername(Socket),
-    io:format("PeerInfo: ~p~n", [PeerInfo]),
     io:format("localInfo: ~p~n", [inet:sockname(Socket)]),
     random:seed(erlang:now()),
     Id = uuid:v4(),
     io:format("id: ~p~n", [uuid:to_string(Id)]),
-    ets:insert(Table, {Id, PeerInfo}),
-    loop(Id, Socket, GlobalState, <<"">>).
+    loop(GlobalState#state{id = Id, sock = Socket}, <<"">>).
 
 % read until SEPARATOR and remove the ending SEPARATOR
 read_cmd(Socket, Buf) ->
@@ -44,20 +40,27 @@ read_cmd(Socket, Buf) ->
     end.
 
 
-loop(Id, Socket, GlobalState, PreBuf) ->
+loop(GlobalState, PreBuf) ->
     Table = GlobalState#state.table,
+    Socket = GlobalState#state.sock,
     io:format("loop: ~p~n", [GlobalState]),
     case read_cmd(Socket, PreBuf) of
         {ok, Data, RemainBuf} ->
             Cmd = parse_cmd(Data),
             command_handler(Socket, GlobalState, Cmd),
-            loop(Id, Socket, GlobalState, RemainBuf);
+            loop(GlobalState, RemainBuf);
         {error, Reason} ->
             io:format("error: ~p~n", [Reason]),
-            ets:delete(Table, Id),
+            ets:delete(Table, GlobalState#state.id),
             ok
     end.
 
+parse_cmd(<<"add ", Remain/binary>>) ->
+    io:format("add ~p~n", [Remain]),
+    case re:run(Remain, <<"\d*\.\d*\.\d*\.\d*:\d*">>) of
+        nomatch -> close; % format error
+        _ -> {add, binary_to_list(Remain)}
+    end;
 parse_cmd(<<"get ", Id/binary>>) ->
     {get, Id};
 parse_cmd(<<"list">>) ->
@@ -68,11 +71,23 @@ parse_cmd(_) ->
 command_handler(Socket, _, close) ->
     gen_tcp:close(Socket);
 
+command_handler(Socket, GlobalState, {add, PeerPrivInfo}) ->
+    {ok, PeerPubInfo} = inet:peername(Socket),
+    PeerPubInfoStr = addr_to_str(PeerPubInfo),
+    Table = GlobalState#state.table,
+    Id = GlobalState#state.id,
+    io:format("PeerPrivateInfo: ~p~n", [PeerPrivInfo]),
+    io:format("PeerPublicInfo: ~p~n", [PeerPubInfo]),
+    ets:insert(Table, {Id, {PeerPubInfoStr, PeerPrivInfo}}),
+    gen_tcp:send(Socket, <<"ok\r\n\n">>);
+
 command_handler(Socket, GlobalState, list) ->
     Table = GlobalState#state.table,
-    Reply = ets:foldl(fun({Id, PeerInfo}, Acc) ->
-                io:format("Id:~p, P:~p~n", [Id, PeerInfo]),
-                uuid:to_string(Id) ++ " " ++ addr_to_str(PeerInfo) ++ "\r\n" ++ Acc
+    Reply = ets:foldl(fun({Id, {PeerPubInfo, PeerPrivInfo}}, Acc) ->
+                io:format("Id:~p, Pub:~p, Priv:~p~n", [Id, PeerPubInfo, PeerPrivInfo]),
+                uuid:to_string(Id) ++ " " ++ PeerPubInfo
+                                   ++ "," ++ PeerPrivInfo
+                                   ++ "\r\n" ++ Acc
             end, "", Table),
     ReplyBin = list_to_binary(Reply),
     gen_tcp:send(Socket, <<ReplyBin/binary, "\r\n">>);
@@ -80,9 +95,10 @@ command_handler(Socket, GlobalState, list) ->
 command_handler(Socket, GlobalState, {get, Id}) ->
     Table = GlobalState#state.table,
     ID = uuid:to_binary(binary_to_list(Id)),
+    io:format("ID: ~p~n", [ID]),
     Reply = case ets:lookup(Table, ID) of
-        [{_, PeerInfo}] ->
-            addr_to_str(PeerInfo);
+        [{_, {PeerPubInfo, PeerPrivInfo}}] ->
+            PeerPubInfo ++ "," ++ PeerPrivInfo;
         _ -> "error"
         end,
     ReplyBin = list_to_binary(Reply),
